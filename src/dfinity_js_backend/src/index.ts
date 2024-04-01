@@ -91,7 +91,7 @@ const flightsStorage = StableBTreeMap(0, text, Flight);
 const persistedBookings = StableBTreeMap(1, Principal, Booking);
 const pendingBookings = StableBTreeMap(2, nat64, Booking);
 
-// fee to be charged upon room reservation and refunded after room is left
+// fee to be charged upon flight reservation and refunded after flight
 let reservationFee: Opt<nat64> = None;
 
 const ORDER_RESERVATION_PERIOD = 120n; // reservation period in seconds
@@ -102,45 +102,51 @@ const ORDER_RESERVATION_PERIOD = 120n; // reservation period in seconds
 */
 const icpCanister = Ledger(Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai"));
 
+
+
+
 export default Canister({
   // set reservation fee
   initData: init([InitPayload], (payload) => {
     reservationFee = Some(payload.reservationFee);
   }),
 
-  // return rooms reservation fee
+  // return flights
   getFlights: query([], Vec(Flight), () => {
     return flightsStorage.values();
   }),
 
-  // return orders
+  // return bookings
   getBookings: query([], Vec(Booking), () => {
     return persistedBookings.values();
   }),
 
-  // return pending orders
+  // return pending bookings
   getPendings: query([], Vec(Booking), () => {
     return pendingBookings.values();
   }),
 
-  // return a particular room
+  // return a particular flight
   getFlight: query([text], Result(Flight, Message), (id) => {
-    const roomOpt = flightsStorage.get(id);
-    if ("None" in roomOpt) {
+    if(!isValidUuid(id)){
+      return Err({InvalidPayload: `Id="${id}" is not in the valid uuid format.`})
+    }
+    const flightOpt = flightsStorage.get(id);
+    if ("None" in flightOpt) {
       return Err({ NotFound: `room with id=${id} not found` });
     }
-    return Ok(roomOpt.Some);
+    return Ok(flightOpt.Some);
   }),
 
 
 
-// return rooms based on price
+// return flights based on price
 getFlightByPrice: query([nat64], Result(Vec(Flight), Message), (maxPrice) => {
   const filteredFlights = flightsStorage.values().filter((flight) => flight.pricePerPerson <= maxPrice);
   return Ok(filteredFlights);
 }),
 
-// return rooms based on departure and arrival places
+// return flights based on departure and arrival places
 getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePlace, arrivalPlace) => {
   const filteredFlights = flightsStorage.values().filter((flight) => 
     flight.departureFrom.toLowerCase() === departurePlace.toLowerCase() &&
@@ -164,10 +170,14 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
 // }),  
 
 
-  // add new room
+  // add new flight
   addFlight: update([FlightPayload], Result(Flight, Message), (payload) => {
     if (typeof payload !== "object" || Object.keys(payload).length === 0) {
       return Err({ NotFound: "invalid payoad" });
+    }
+    const validatePayloadErrors = validateFlightPayload(payload);
+    if (validatePayloadErrors.length){
+        return Err({InvalidPayload: `Invalid payload. Errors=[${validatePayloadErrors}]`});
     }
     const flight = {
       id: uuidv4(),
@@ -184,7 +194,10 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
 
   // delete flight
   deleteFlight: update([text], Result(text, Message), (id) => {
-    // check flight before deleting
+    if(!isValidUuid(id)){
+      return Err({InvalidPayload: `Id="${id}" is not in the valid uuid format.`})
+    }
+    // check if flight exists before deleting
     const flightOpt = flightsStorage.get(id);
     if ("None" in flightOpt) {
       return Err({
@@ -201,16 +214,19 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
         Booked: `flight with id ${id} is currently booked`,
       });
     }
-    const deletedRoomOpt = flightsStorage.remove(id);
+    flightsStorage.remove(id);
 
-    return Ok(deletedRoomOpt.Some.id);
+    return Ok(flightOpt.Some.id);
   }),
 
-  // create order for room reservation
+  // create booking for flight reservation
   createReservationOrder: update(
     [text, nat64],
     Result(Booking, Message),
     (id, noOfPersons) => {
+      if(!isValidUuid(id)){
+        return Err({InvalidPayload: `Id="${id}" is not in the valid uuid format.`})
+      }
       const flightOpt = flightsStorage.get(id);
       if ("None" in flightOpt) {
         return Err({
@@ -229,6 +245,11 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
       if (flight.isReserved) {
         return Err({
           Booked: `flight with id ${id} is currently booked`,
+        });
+      }
+      if (flight.seats < noOfPersons) {
+        return Err({
+          InvalidPayload: `flight with id ${id} does not have enough seats to accomodate ${noOfPersons} people.`,
         });
       }
 
@@ -255,12 +276,15 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
     }
   ),
 
-  // complete room reservation
+  // complete flight reservation
   completeReservation: update(
     [text, nat64, nat64, nat64],
     Result(Booking, Message),
     async (id, noOfPersons, block, memo) => {
-      // get room
+      if(!isValidUuid(id)){
+        return Err({InvalidPayload: `Id="${id}" is not in the valid uuid format.`})
+      }
+      // get flight
       const flightOpt = flightsStorage.get(id);
       if ("None" in flightOpt) {
         throw Error(`flight with id=${id} not found`);
@@ -313,6 +337,7 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
       const updatedFlight = {
         ...flight,
         currentReservedTo: Some(ic.caller()),
+        isAvailable: false,
         isReserved: true,
         currentReservationEnds: Some(ic.time() + durationInMins),
       };
@@ -324,9 +349,12 @@ getFlightByPlace: query([text, text], Result(Vec(Flight), Message), (departurePl
   ),
 
   // end reservation and receive your refund
-  // complete room reservation
+  // complete flight reservation
   endReservation: update([text], Result(Message, Message), async (id) => {
-    // get room
+    if(!isValidUuid(id)){
+      return Err({InvalidPayload: `Id="${id}" is not in the valid uuid format.`})
+    }
+    // get flight
     const flightOpt = flightsStorage.get(id);
     if ("None" in flightOpt) {
       return Err({ NotFound: `flight with id=${id} not found` });
@@ -456,13 +484,13 @@ function generateCorrelationId(productId: text): nat64 {
 }
 
 /*
-    after the order is created, we give the `delay` amount of minutes to pay for the order.
-    if it's not paid during this timeframe, the order is automatically removed from the pending orders.
+    after the booking is created, we give the `delay` amount of minutes to pay for the booking.
+    if it's not paid during this timeframe, the booking is automatically removed from the pending bookings.
 */
 function discardByTimeout(memo: nat64, delay: Duration) {
   ic.setTimer(delay, () => {
-    const order = pendingBookings.remove(memo);
-    console.log(`Order discarded ${order}`);
+    const booking = pendingBookings.remove(memo);
+    console.log(`Booking discarded ${booking}`);
   });
 }
 
@@ -490,4 +518,51 @@ async function verifyPaymentInternal(
     );
   });
   return tx ? true : false;
+}
+
+
+// Helper function that trims the input string and then checks the length
+// The string is empty if true is returned, otherwise, string is a valid value
+function isInvalidString(str: text): boolean {
+  return str.trim().length == 0
+}
+
+// Helper function to ensure the input id meets the format used for ids generated by uuid
+function isValidUuid(id: string): boolean {
+  const regexExp = /^[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}$/gi;
+  return regexExp.test(id);
+}
+
+
+/**
+* Helper function to validate the FlightPayload
+*/
+function validateFlightPayload(payload: typeof FlightPayload): Vec<string>{
+  const errors: Vec<text> = [];
+
+  if (isInvalidString(payload.arriveTo)){
+      errors.push(`arriveTo='${payload.arriveTo}' cannot be empty.`)
+  }
+  if (isInvalidString(payload.departureFrom)){
+      errors.push(`departureFrom='${payload.departureFrom}' cannot be empty.`)
+  }
+  if (isInvalidString(payload.description)){
+      errors.push(`description='${payload.description}' cannot be empty.`)
+  }
+  if (isInvalidString(payload.name)){
+      errors.push(`name='${payload.name}' cannot be empty.`)
+  }
+  if (isInvalidString(payload.imageUrl)){
+      errors.push(`imageUrl='${payload.imageUrl}' cannot be empty.`)
+  }
+  if (payload.pricePerPerson == BigInt(0)){
+      errors.push(`pricePerPerson='${payload.pricePerPerson}' must be greater than zero.`)
+  }
+  if (payload.seats == BigInt(0)){
+      errors.push(`seats='${payload.seats}' must be greater than zero.`)
+  }
+  if (payload.departureTime <= ic.time()){
+      errors.push(`departureTime='${payload.departureTime}' must be greater than ${ic.time()}.`)
+  }
+  return errors;
 }
